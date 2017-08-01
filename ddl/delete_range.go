@@ -128,8 +128,8 @@ func LoadDeleteRanges(ctx context.Context, safePoint uint64) (ranges []DelRangeT
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		if row == nil {
-			return
+		if row != nil {
+			break
 		}
 		startKey, err := hex.DecodeString(row.Data[2].GetString())
 		if err != nil {
