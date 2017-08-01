@@ -40,6 +40,11 @@ import (
 	goctx "golang.org/x/net/context"
 )
 
+const (
+	// Any job with version after this should be inserted into gc_delete_range table.
+	bgJobMigrateVersion = 15
+)
+
 var (
 	// errWorkerClosed means we have already closed the DDL worker.
 	errInvalidWorker = terror.ClassDDL.New(codeInvalidWorker, "invalid worker")
@@ -209,8 +214,7 @@ type ddl struct {
 
 	workerVars *variable.SessionVars
 
-	sqlCtx   context.Context
-	delRange *delRangeEmulator
+	delRangeManager delRangeManager
 }
 
 // RegisterEventCh registers passed channel for ddl Event.
@@ -250,28 +254,6 @@ func NewDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
 
 func newDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
 	infoHandle *infoschema.Handle, hook Callback, lease time.Duration, ctxPool *pools.ResourcePool) *ddl {
-	d := initDDL(ctx, etcdCli, store, infoHandle, hook, lease)
-
-	// Attach a session to INSERT gc_delete_range table.
-	resource, _ := ctxPool.Get()
-	d.sqlCtx = resource.(context.Context)
-	d.sqlCtx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, false)
-
-	// if the store doesn't support delete-range, start a emulator to do that.
-	if !store.SupportDeleteRange() {
-		d.delRange = newDelRangeEmulator(d, ctxPool)
-	}
-
-	d.start(ctx)
-
-	variable.RegisterStatistics(d)
-	log.Infof("start DDL:%s, with delete-range emulator:%t", d.uuid, !store.SupportDeleteRange())
-
-	return d
-}
-
-func initDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
-	infoHandle *infoschema.Handle, hook Callback, lease time.Duration) *ddl {
 	if hook == nil {
 		hook = &BaseCallback{}
 	}
@@ -280,9 +262,9 @@ func initDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
 	ctx, cancelFunc := goctx.WithCancel(ctx)
 	var manager OwnerManager
 	var syncer SchemaSyncer
-	// If etcdCli is nil, it's the local store, so use the mockOwnerManager and mockSchemaSyncer.
-	// It's always used for testing.
 	if etcdCli == nil {
+		// The etcdCli is nil if the store is localstore which is only used for testing.
+		// So we use mockOwnerManager and mockSchemaSyncer.
 		manager = NewMockOwnerManager(id, cancelFunc)
 		syncer = NewMockSchemaSyncer()
 	} else {
@@ -302,6 +284,18 @@ func initDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
 		workerVars:   variable.NewSessionVars(),
 	}
 	d.workerVars.BinlogClient = binloginfo.GetPumpClient()
+
+	if ctxPool != nil {
+		d.delRangeManager = newDelRangeManager(d, ctxPool, store)
+	} else {
+		d.delRangeManager = newMockDelRangeManager()
+	}
+
+	d.start(ctx)
+
+	variable.RegisterStatistics(d)
+	log.Infof("start DDL:%s, with delete-range emulator:%t", d.uuid, !store.SupportDeleteRange())
+
 	return d
 }
 
@@ -326,25 +320,21 @@ func (d *ddl) start(ctx goctx.Context) {
 	// check owner firstly and try to find whether a job exists and run.
 	asyncNotify(d.ddlJobCh)
 
-	if d.delRange != nil {
-		d.wait.Add(1)
-		d.delRange.start()
-	}
+	d.delRangeManager.start()
 }
 
 func (d *ddl) close() {
 	if d.isClosed() {
 		return
 	}
-
 	close(d.quitCh)
 	d.ownerManager.Cancel()
 	err := d.schemaSyncer.RemoveSelfVersionPath()
 	if err != nil {
 		log.Errorf("[ddl] remove self version path failed %v", err)
 	}
-
 	d.wait.Wait()
+	d.delRangeManager.clear()
 	log.Infof("close DDL:%s", d.uuid)
 }
 

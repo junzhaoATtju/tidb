@@ -36,22 +36,90 @@ const (
 	completeDeleteRangeSQL = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
 )
 
-// LoadPendingBgJobsIntoDeleteTable loads all pending DDL backgroud jobs
-// into table `gc_delete_range` so that gc worker can process them.
-// NOTE: This function WILL NOT start and run in a new transaction internally.
-func LoadPendingBgJobsIntoDeleteTable(ctx context.Context) (err error) {
-	var met = meta.NewMeta(ctx.Txn())
-	for {
-		var job *model.Job
-		job, err = met.DeQueueBgJob()
-		if err != nil || job == nil {
-			break
-		}
-		err = insertBgJobIntoDeleteRangeTable(ctx, job)
-		if err != nil {
-			break
-		}
+type delRangeManager interface {
+	addDelRangeJob(job *model.Job) error
+	start()
+	clear()
+}
+
+type delRange struct {
+	d            *ddl
+	ctxPool      *pools.ResourcePool
+	storeSupport bool
+}
+
+func newDelRangeManager(d *ddl, ctxPool *pools.ResourcePool, store kv.Storage) delRangeManager {
+	return &delRange{
+		d:            d,
+		ctxPool:      ctxPool,
+		storeSupport: store.SupportDeleteRange(),
 	}
+}
+
+// addDelRangeJob implements delRangeManager interface.
+func (dr *delRange) addDelRangeJob(job *model.Job) error {
+	resource, err := dr.ctxPool.Get()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer dr.ctxPool.Put(resource)
+	ctx := resource.(context.Context)
+	ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, false)
+
+	err = startTxn(ctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	err = insertBgJobIntoDeleteRangeTable(ctx, job)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	err = commitTxn(ctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	log.Infof("[ddl] add job (%d,%s) into delete-range table", job.ID, job.Type.String())
+	return nil
+}
+
+// start implements delRangeManager interface.
+func (dr *delRange) start() {
+	if !dr.storeSupport {
+		dr.d.wait.Add(1)
+		go func() {
+			defer dr.d.wait.Done()
+
+			checkTime := 60 * time.Second // TODO: get from safepoint.
+			ticker := time.NewTicker(checkTime)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+				case <-dr.d.quitCh:
+					return
+				}
+				// TODO: Emulate delete-range here.
+			}
+		}()
+	}
+}
+
+// clear implements delRangeManager interface.
+func (dr *delRange) clear() {
+	dr.ctxPool.Close()
+}
+
+// startTxn starts a new transaction on the context.
+func startTxn(ctx context.Context) error {
+	s := ctx.(sqlexec.SQLExecutor)
+	_, err := s.Execute("BEGIN")
+	return errors.Trace(err)
+}
+
+// commitTxn commits the current transaction on the context.
+func commitTxn(ctx context.Context) error {
+	s := ctx.(sqlexec.SQLExecutor)
+	_, err := s.Execute("COMMIT")
 	return errors.Trace(err)
 }
 
@@ -80,18 +148,6 @@ func insertBgJobIntoDeleteRangeTable(ctx context.Context, job *model.Job) error 
 		return doInsert(s, job.ID, tableID, startKey, endKey, time.Now().Unix())
 	}
 	return nil
-}
-
-func startTxn(ctx context.Context) error {
-	s := ctx.(sqlexec.SQLExecutor)
-	_, err := s.Execute("BEGIN")
-	return errors.Trace(err)
-}
-
-func commitTxn(ctx context.Context) error {
-	s := ctx.(sqlexec.SQLExecutor)
-	_, err := s.Execute("COMMIT")
-	return errors.Trace(err)
 }
 
 func doInsert(s sqlexec.SQLExecutor, jobID int64, elementID int64, startKey, endKey kv.Key, ts int64) error {
@@ -157,38 +213,27 @@ func CompleteDeleteRange(ctx context.Context, dr DelRangeTask) error {
 	return errors.Trace(err)
 }
 
-// delRangeEmulator is only for localstore which doesn't support delete-range.
-type delRangeEmulator struct {
-	ddl    *ddl
-	sqlCtx context.Context
-}
-
-// newDelRangeEmulator binds a SQL context on a delRangeEmulator and returns it.
-func newDelRangeEmulator(ddl *ddl, ctxPool *pools.ResourcePool) *delRangeEmulator {
-	resource, _ := ctxPool.Get()
-	ctx := resource.(context.Context)
-	ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, false)
-	return &delRangeEmulator{
-		ddl:    ddl,
-		sqlCtx: ctx,
-	}
-	return nil
-}
-
-func (delRange *delRangeEmulator) start() {
-	go func() {
-		defer delRange.ddl.wait.Done()
-
-		checkTime := 60 * time.Second // TODO: get from safepoint.
-		ticker := time.NewTicker(checkTime)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-			case <-delRange.ddl.quitCh:
-				return
-			}
-			// TODO: Emulate delete-range here.
+// LoadPendingBgJobsIntoDeleteTable loads all pending DDL backgroud jobs
+// into table `gc_delete_range` so that gc worker can process them.
+// NOTE: This function WILL NOT start and run in a new transaction internally.
+func LoadPendingBgJobsIntoDeleteTable(ctx context.Context) (err error) {
+	log.Infof("[ddl] loading pending backgroud DDL jobs")
+	var met = meta.NewMeta(ctx.Txn())
+	for {
+		var job *model.Job
+		job, err = met.DeQueueBgJob()
+		if err != nil || job == nil {
+			break
 		}
-	}()
+		err = insertBgJobIntoDeleteRangeTable(ctx, job)
+		if err != nil {
+			break
+		}
+	}
+	return errors.Trace(err)
+}
+
+func newMockDelRangeManager() delRangeManager {
+	// TODO: real code.
+	return nil
 }

@@ -111,19 +111,22 @@ func (d *ddl) updateDDLJob(t *meta.Meta, job *model.Job, updateTS uint64) error 
 func (d *ddl) finishDDLJob(t *meta.Meta, job *model.Job) error {
 	switch job.Type {
 	case model.ActionDropSchema, model.ActionDropTable, model.ActionTruncateTable:
-		err := startTxn(d.sqlCtx)
-		if err != nil {
+		if job.Version < bgJobMigrateVersion {
+			log.Infof("[ddl] enqueue old job %d into backgroud queue", job.ID)
+			err := t.EnQueueBgJob(&model.Job{
+				ID:       job.ID,
+				SchemaID: job.SchemaID,
+				TableID:  job.TableID,
+				Type:     job.Type,
+				RawArgs:  job.RawArgs,
+			})
 			return errors.Trace(err)
+		} else {
+			err := d.delRangeManager.addDelRangeJob(job)
+			if err != nil {
+				return errors.Trace(err)
+			}
 		}
-		err = insertBgJobIntoDeleteRangeTable(d.sqlCtx, job)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		err = commitTxn(d.sqlCtx)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		log.Infof("[ddl] add job (%d,%s) into delete-range table", job.ID, job.Type.String())
 	}
 
 	_, err := t.DeQueueDDLJob()
