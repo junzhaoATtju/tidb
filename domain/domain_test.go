@@ -38,29 +38,12 @@ var _ = Suite(&testSuite{})
 type testSuite struct {
 }
 
-type mockContext struct {
-	*mock.Context
-}
-
-func testNewContext() *mockContext {
-	ctx := &mockContext{mock.NewContext()}
-	return ctx
-}
-
-func (mc *mockContext) Execute(sql string) ([]ast.RecordSet, error) {
-	return nil, nil
-}
-
-func (mc *mockContext) Close() {
-	return
-}
-
 func mockFactory() (pools.Resource, error) {
 	return nil, errors.New("mock factory should not be called")
 }
 
-func mockSysFactory(dom *Domain) (pools.Resource, error) {
-	return testNewContext(), errors.New("mock factory should not be called")
+func sysMockFactory(dom *Domain) (pools.Resource, error) {
+	return nil, nil
 }
 
 func (*testSuite) TestT(c *C) {
@@ -68,7 +51,7 @@ func (*testSuite) TestT(c *C) {
 	store, err := driver.Open("memory")
 	c.Assert(err, IsNil)
 	defer testleak.AfterTest(c)()
-	dom, err := NewDomain(store, 80*time.Millisecond, 0, mockFactory, mockSysFactory)
+	dom, err := NewDomain(store, 80*time.Millisecond, 0, mockFactory, sysMockFactory)
 	c.Assert(err, IsNil)
 	store = dom.Store()
 	ctx := mock.NewContext()

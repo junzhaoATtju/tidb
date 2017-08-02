@@ -28,7 +28,6 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/store/localstore/goleveldb"
 	"github.com/pingcap/tidb/util/mock"
@@ -48,32 +47,15 @@ func testCreateStore(c *C, name string) kv.Storage {
 	return store
 }
 
-type mockContext struct {
-	*mock.Context
-}
-
 func testNewContext(d *ddl) context.Context {
-	ctx := &mockContext{mock.NewContext()}
+	ctx := mock.NewContext()
 	ctx.Store = d.store
 	return ctx
 }
 
-func (mc *mockContext) Execute(sql string) ([]ast.RecordSet, error) {
-	return nil, nil
-}
-
 func testNewDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
 	infoHandle *infoschema.Handle, hook Callback, lease time.Duration) *ddl {
-	d := initDDL(ctx, etcdCli, store, infoHandle, hook, lease)
-	d.sqlCtx = testNewContext(d)
-	d.delRange = nil
-
-	d.start(ctx)
-
-	variable.RegisterStatistics(d)
-	log.Infof("start DDL:%s, with delete-range emulator:%t", d.uuid, !store.SupportDeleteRange())
-
-	return d
+	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease, nil)
 }
 
 func getSchemaVer(c *C, ctx context.Context) int64 {

@@ -64,17 +64,9 @@ func (dr *delRange) addDelRangeJob(job *model.Job) error {
 	}
 	defer dr.ctxPool.Put(resource)
 	ctx := resource.(context.Context)
-	ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, false)
+	ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, true)
 
-	err = startTxn(ctx)
-	if err != nil {
-		return errors.Trace(err)
-	}
 	err = insertBgJobIntoDeleteRangeTable(ctx, job)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	err = commitTxn(ctx)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -233,7 +225,25 @@ func LoadPendingBgJobsIntoDeleteTable(ctx context.Context) (err error) {
 	return errors.Trace(err)
 }
 
+type mockDelRange struct {
+}
+
+// newMockDelRangeManager creates a mock delRangeManager only used for test.
 func newMockDelRangeManager() delRangeManager {
-	// TODO: real code.
+	return &mockDelRange{}
+}
+
+// addDelRangeJob implements delRangeManager interface.
+func (dr *mockDelRange) addDelRangeJob(job *model.Job) error {
 	return nil
+}
+
+// start implements delRangeManager interface.
+func (dr *mockDelRange) start() {
+	return
+}
+
+// clear implements delRangeManager interface.
+func (dr *mockDelRange) clear() {
+	return
 }
