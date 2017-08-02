@@ -39,7 +39,7 @@ const (
 	completeDeleteRangeSQL = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
 	loadSafePointSQL       = `SELECT variable_value FROM mysql.tidb WHERE variable_name = "tikv_gc_safe_point" FOR UPDATE`
 
-	delBatchSize = 4
+	delBatchSize = 65536
 	delBackLog   = 128
 )
 
@@ -214,6 +214,16 @@ func insertBgJobIntoDeleteRangeTable(ctx context.Context, job *model.Job) error 
 		startKey := tablecodec.EncodeTablePrefix(tableID)
 		endKey := tablecodec.EncodeTablePrefix(tableID + 1)
 		return doInsert(s, job.ID, tableID, startKey, endKey, time.Now().Unix())
+	case model.ActionDropIndex:
+		tableID := job.TableID
+		var indexName interface{}
+		var indexID int64
+		if err := job.DecodeArgs(&indexName, &indexID); err != nil {
+			return errors.Trace(err)
+		}
+		startKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID)
+		endKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID+1)
+		return doInsert(s, job.ID, indexID, startKey, endKey, time.Now().Unix())
 	}
 	return nil
 }

@@ -671,7 +671,7 @@ func (s *MvccStore) MvccGetByStartTS(startKey, endKey []byte, starTS uint64) (*k
 }
 
 // MvccGetByKey gets mvcc info for the key
-func (s MvccStore) MvccGetByKey(key []byte) *kvrpcpb.MvccInfo {
+func (s *MvccStore) MvccGetByKey(key []byte) *kvrpcpb.MvccInfo {
 	s.RLock()
 	defer s.RUnlock()
 

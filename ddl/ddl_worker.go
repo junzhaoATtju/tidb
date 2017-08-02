@@ -109,7 +109,7 @@ func (d *ddl) updateDDLJob(t *meta.Meta, job *model.Job, updateTS uint64) error 
 // If the DDL job need to handle in background, it will prepare a background job.
 func (d *ddl) finishDDLJob(t *meta.Meta, job *model.Job) (err error) {
 	switch job.Type {
-	case model.ActionDropSchema, model.ActionDropTable, model.ActionTruncateTable:
+	case model.ActionDropSchema, model.ActionDropTable, model.ActionTruncateTable, model.ActionDropIndex:
 		if job.Version < bgJobMigrateVersion {
 			log.Infof("[ddl] deal with old job %d (version %d)", job.ID, job.Version)
 			err = t.EnQueueBgJob(&model.Job{
