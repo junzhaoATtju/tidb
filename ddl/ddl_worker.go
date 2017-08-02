@@ -108,34 +108,32 @@ func (d *ddl) updateDDLJob(t *meta.Meta, job *model.Job, updateTS uint64) error 
 
 // finishDDLJob deletes the finished DDL job in the ddl queue and puts it to history queue.
 // If the DDL job need to handle in background, it will prepare a background job.
-func (d *ddl) finishDDLJob(t *meta.Meta, job *model.Job) error {
+func (d *ddl) finishDDLJob(t *meta.Meta, job *model.Job) (err error) {
 	switch job.Type {
 	case model.ActionDropSchema, model.ActionDropTable, model.ActionTruncateTable:
 		if job.Version < bgJobMigrateVersion {
 			log.Infof("[ddl] enqueue old job %d into backgroud queue", job.ID)
-			err := t.EnQueueBgJob(&model.Job{
+			err = t.EnQueueBgJob(&model.Job{
 				ID:       job.ID,
 				SchemaID: job.SchemaID,
 				TableID:  job.TableID,
 				Type:     job.Type,
 				RawArgs:  job.RawArgs,
 			})
-			return errors.Trace(err)
 		} else {
-			err := d.delRangeManager.addDelRangeJob(job)
-			if err != nil {
-				return errors.Trace(err)
-			}
+			err = d.delRangeManager.addDelRangeJob(job)
+		}
+		if err != nil {
+			return errors.Trace(err)
 		}
 	}
 
-	_, err := t.DeQueueDDLJob()
+	_, err = t.DeQueueDDLJob()
 	if err != nil {
 		return errors.Trace(err)
 	}
 
 	log.Infof("[ddl] finish DDL job %v", job)
-
 	err = t.AddHistoryDDLJob(job)
 	return errors.Trace(err)
 }
