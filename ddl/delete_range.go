@@ -34,6 +34,7 @@ const (
 	insertDeleteRangeSQL   = `INSERT IGNORE INTO mysql.gc_delete_range VALUES ("%d", "%d", "%s", "%s", "%d")`
 	loadDeleteRangeSQL     = `SELECT job_id, element_id, start_key, end_key FROM mysql.gc_delete_range WHERE ts < %v`
 	completeDeleteRangeSQL = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
+	loadSafePointSQL       = `SELECT variable_value FROM mysql.tidb WHERE variable_name = "tikv_gc_safe_point" FOR UPDATE`
 )
 
 type delRangeManager interface {
@@ -76,29 +77,46 @@ func (dr *delRange) addDelRangeJob(job *model.Job) error {
 
 // start implements delRangeManager interface.
 func (dr *delRange) start() {
-	if !dr.storeSupport {
-		dr.d.wait.Add(1)
-		go func() {
-			defer dr.d.wait.Done()
-
-			checkTime := 60 * time.Second // TODO: get from safepoint.
-			ticker := time.NewTicker(checkTime)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-				case <-dr.d.quitCh:
-					return
-				}
-				// TODO: Emulate delete-range here.
-			}
-		}()
+	if dr.storeSupport {
+		return
 	}
+	go dr.startEmulator()
 }
 
 // clear implements delRangeManager interface.
 func (dr *delRange) clear() {
 	dr.ctxPool.Close()
+}
+
+func (dr *delRange) startEmulator() {
+	dr.d.wait.Add(1)
+	defer dr.d.wait.Done()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+		case <-dr.d.quitCh:
+			return
+		}
+		resource, err := dr.ctxPool.Get()
+		if err != nil {
+			log.Errorf("[ddl] delRange emulator get session fail: %s", err)
+			continue
+		}
+		defer dr.ctxPool.Put(resource)
+		ctx := resource.(context.Context)
+		ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, true)
+
+		// ranges, err := LoadDeleteRanges(ctx) // todo: calculate safe point.
+		for _, r := range ranges {
+			startKey, endKey := r.Range()
+			for {
+
+			}
+		}
+		// TODO: Emulate delete-range here.
+	}
 }
 
 // startTxn starts a new transaction on the context.
@@ -149,6 +167,23 @@ func doInsert(s sqlexec.SQLExecutor, jobID int64, elementID int64, startKey, end
 	sql := fmt.Sprintf(insertDeleteRangeSQL, jobID, elementID, startKeyEncoded, endKeyEncoded, ts)
 	_, err := s.Execute(sql)
 	return errors.Trace(err)
+}
+
+func loadSafePoint(ctx context.Context) (*time.Time, error) {
+	// rss, err := ctx.(sqlexec.SQLExecutor).Execute(loadSafePointSQL)
+	// if err != nil {
+	// 	return nil, errors.Trace(err)
+	// }
+	// row, err := rss[0].Next()
+	// if err != nil || row == nil {
+	// 	return nil, errors.Trace(nil)
+	// }
+	// timeFormat := "20060102-15:04:05 -0700 MST"
+	// t, err := time.Parse(timeFormat, row.Data[0].GetString())
+	// if err != nil {
+	// 	return nil, errors.Trace(nil)
+	// }
+	// return &t, nil
 }
 
 // DelRangeTask is for run delete-range command in gc_worker.
