@@ -14,8 +14,10 @@
 package ddl
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/juju/errors"
@@ -27,14 +29,17 @@ import (
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/sqlexec"
 )
 
 const (
 	insertDeleteRangeSQL   = `INSERT IGNORE INTO mysql.gc_delete_range VALUES ("%d", "%d", "%s", "%s", "%d")`
-	loadDeleteRangeSQL     = `SELECT job_id, element_id, start_key, end_key FROM mysql.gc_delete_range WHERE ts < %v`
+	loadDeleteRangeSQL     = `SELECT job_id, element_id, start_key, end_key FROM mysql.gc_delete_range WHERE ts < %v ORDER BY ts`
 	completeDeleteRangeSQL = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
 	loadSafePointSQL       = `SELECT variable_value FROM mysql.tidb WHERE variable_name = "tikv_gc_safe_point" FOR UPDATE`
+
+	delBatchSize = 65536
 )
 
 type delRangeManager interface {
@@ -47,14 +52,20 @@ type delRange struct {
 	d            *ddl
 	ctxPool      *pools.ResourcePool
 	storeSupport bool
+	keys         []kv.Key
 }
 
+// newDelRangeManager returns a delRangeManager.
 func newDelRangeManager(d *ddl, ctxPool *pools.ResourcePool, store kv.Storage) delRangeManager {
-	return &delRange{
+	dr := &delRange{
 		d:            d,
 		ctxPool:      ctxPool,
 		storeSupport: store.SupportDeleteRange(),
 	}
+	if !dr.storeSupport {
+		dr.keys = make([]kv.Key, 0, delBatchSize)
+	}
+	return dr
 }
 
 // addDelRangeJob implements delRangeManager interface.
@@ -93,12 +104,14 @@ func (dr *delRange) startEmulator() {
 	defer dr.d.wait.Done()
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
 		case <-dr.d.quitCh:
 			return
 		}
+
 		resource, err := dr.ctxPool.Get()
 		if err != nil {
 			log.Errorf("[ddl] delRange emulator get session fail: %s", err)
@@ -108,29 +121,62 @@ func (dr *delRange) startEmulator() {
 		ctx := resource.(context.Context)
 		ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, true)
 
-		// ranges, err := LoadDeleteRanges(ctx) // todo: calculate safe point.
-		for _, r := range ranges {
-			startKey, endKey := r.Range()
-			for {
+		ranges, err := LoadDeleteRanges(ctx, math.MaxInt64)
+		if err != nil {
+			log.Errorf("[dd] delRange emulator load tasks fail: %s", err)
+			continue
+		}
 
+		for _, r := range ranges {
+			if err := dr.doTask(r); err != nil {
+				log.Errorf("[ddl] delRange emulator do task fail: %s", err)
+				continue
+			}
+			if err := CompleteDeleteRange(ctx, r); err != nil {
+				log.Errorf("[ddl] delRange emulator complete task fail: %s", err)
+				continue
 			}
 		}
-		// TODO: Emulate delete-range here.
 	}
 }
 
-// startTxn starts a new transaction on the context.
-func startTxn(ctx context.Context) error {
-	s := ctx.(sqlexec.SQLExecutor)
-	_, err := s.Execute("BEGIN")
-	return errors.Trace(err)
-}
+func (dr *delRange) doTask(r DelRangeTask) error {
+	for {
+		finish := false
+		dr.keys = dr.keys[:0]
+		err := kv.RunInNewTxn(dr.d.store, true, func(txn kv.Transaction) error {
+			iter, err := txn.Seek(r.startKey)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			defer iter.Close()
 
-// commitTxn commits the current transaction on the context.
-func commitTxn(ctx context.Context) error {
-	s := ctx.(sqlexec.SQLExecutor)
-	_, err := s.Execute("COMMIT")
-	return errors.Trace(err)
+			for i := 0; i < delBatchSize; i++ {
+				if iter.Valid() {
+					finish = bytes.Equal(iter.Key(), r.endKey)
+					if !finish {
+						dr.keys = append(dr.keys, iter.Key().Clone())
+						continue
+					}
+				}
+				break
+			}
+			for _, key := range dr.keys {
+				err := txn.Delete(key)
+				if err != nil && !terror.ErrorEqual(err, kv.ErrNotExist) {
+					return errors.Trace(err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if finish {
+			break
+		}
+	}
+	return nil
 }
 
 // insertBgJobIntoDeleteRangeTable parses the job into delete-range arguments,
@@ -167,23 +213,6 @@ func doInsert(s sqlexec.SQLExecutor, jobID int64, elementID int64, startKey, end
 	sql := fmt.Sprintf(insertDeleteRangeSQL, jobID, elementID, startKeyEncoded, endKeyEncoded, ts)
 	_, err := s.Execute(sql)
 	return errors.Trace(err)
-}
-
-func loadSafePoint(ctx context.Context) (*time.Time, error) {
-	// rss, err := ctx.(sqlexec.SQLExecutor).Execute(loadSafePointSQL)
-	// if err != nil {
-	// 	return nil, errors.Trace(err)
-	// }
-	// row, err := rss[0].Next()
-	// if err != nil || row == nil {
-	// 	return nil, errors.Trace(nil)
-	// }
-	// timeFormat := "20060102-15:04:05 -0700 MST"
-	// t, err := time.Parse(timeFormat, row.Data[0].GetString())
-	// if err != nil {
-	// 	return nil, errors.Trace(nil)
-	// }
-	// return &t, nil
 }
 
 // DelRangeTask is for run delete-range command in gc_worker.
