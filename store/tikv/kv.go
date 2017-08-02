@@ -291,6 +291,9 @@ func (s *tikvStore) GetOracle() oracle.Oracle {
 }
 
 func (s *tikvStore) SupportDeleteRange() (supported bool) {
+	if s.mock {
+		return false
+	}
 	return true
 }
 

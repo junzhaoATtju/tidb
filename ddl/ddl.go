@@ -288,7 +288,9 @@ func newDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
 	d.workerVars.BinlogClient = binloginfo.GetPumpClient()
 
 	if ctxPool != nil {
-		d.delRangeManager = newDelRangeManager(d, ctxPool, store)
+		supportDelRange := store.SupportDeleteRange()
+		d.delRangeManager = newDelRangeManager(d, ctxPool, supportDelRange)
+		log.Infof("[ddl] start delRangeManager OK, with emulator: %t", !supportDelRange)
 	} else {
 		d.delRangeManager = newMockDelRangeManager()
 	}

@@ -39,7 +39,8 @@ const (
 	completeDeleteRangeSQL = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
 	loadSafePointSQL       = `SELECT variable_value FROM mysql.tidb WHERE variable_name = "tikv_gc_safe_point" FOR UPDATE`
 
-	delBatchSize = 65536
+	delBatchSize = 4
+	delBackLog   = 128
 )
 
 type delRangeManager interface {
@@ -52,17 +53,19 @@ type delRange struct {
 	d            *ddl
 	ctxPool      *pools.ResourcePool
 	storeSupport bool
+	emulatorCh   chan struct{}
 	keys         []kv.Key
 }
 
 // newDelRangeManager returns a delRangeManager.
-func newDelRangeManager(d *ddl, ctxPool *pools.ResourcePool, store kv.Storage) delRangeManager {
+func newDelRangeManager(d *ddl, ctxPool *pools.ResourcePool, supportDelRange bool) delRangeManager {
 	dr := &delRange{
 		d:            d,
 		ctxPool:      ctxPool,
-		storeSupport: store.SupportDeleteRange(),
+		storeSupport: supportDelRange,
 	}
 	if !dr.storeSupport {
+		dr.emulatorCh = make(chan struct{}, delBackLog)
 		dr.keys = make([]kv.Key, 0, delBatchSize)
 	}
 	return dr
@@ -82,69 +85,75 @@ func (dr *delRange) addDelRangeJob(job *model.Job) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	if !dr.storeSupport {
+		dr.emulatorCh <- struct{}{}
+	}
 	log.Infof("[ddl] add job (%d,%s) into delete-range table", job.ID, job.Type.String())
 	return nil
 }
 
 // start implements delRangeManager interface.
 func (dr *delRange) start() {
-	if dr.storeSupport {
-		return
+	if !dr.storeSupport {
+		go dr.startEmulator()
 	}
-	go dr.startEmulator()
 }
 
 // clear implements delRangeManager interface.
 func (dr *delRange) clear() {
+	log.Infof("[ddl] closing delRange session pool")
 	dr.ctxPool.Close()
 }
 
 func (dr *delRange) startEmulator() {
+	log.Infof("[ddl] start delRange emulator")
 	dr.d.wait.Add(1)
 	defer dr.d.wait.Done()
-	ticker := time.NewTicker(60 * time.Second)
-	defer ticker.Stop()
-
 	for {
 		select {
-		case <-ticker.C:
+		case <-dr.emulatorCh:
 		case <-dr.d.quitCh:
 			return
 		}
-
-		resource, err := dr.ctxPool.Get()
-		if err != nil {
-			log.Errorf("[ddl] delRange emulator get session fail: %s", err)
-			continue
-		}
-		defer dr.ctxPool.Put(resource)
-		ctx := resource.(context.Context)
-		ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, true)
-
-		ranges, err := LoadDeleteRanges(ctx, math.MaxInt64)
-		if err != nil {
-			log.Errorf("[dd] delRange emulator load tasks fail: %s", err)
-			continue
-		}
-
-		for _, r := range ranges {
-			if err := dr.doTask(r); err != nil {
-				log.Errorf("[ddl] delRange emulator do task fail: %s", err)
-				continue
-			}
-			if err := CompleteDeleteRange(ctx, r); err != nil {
-				log.Errorf("[ddl] delRange emulator complete task fail: %s", err)
-				continue
-			}
-		}
+		dr.doDelRangeWork()
 	}
+}
+
+func (dr *delRange) doDelRangeWork() error {
+	resource, err := dr.ctxPool.Get()
+	if err != nil {
+		log.Errorf("[ddl] delRange emulator get session fail: %s", err)
+		return errors.Trace(err)
+	}
+	defer dr.ctxPool.Put(resource)
+	ctx := resource.(context.Context)
+	ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, true)
+
+	ranges, err := LoadDeleteRanges(ctx, math.MaxInt64)
+	if err != nil {
+		log.Errorf("[dd] delRange emulator load tasks fail: %s", err)
+		return errors.Trace(err)
+	}
+
+	for _, r := range ranges {
+		if err := dr.doTask(r); err != nil {
+			log.Errorf("[ddl] delRange emulator do task fail: %s", err)
+			return errors.Trace(err)
+		}
+		if err := CompleteDeleteRange(ctx, r); err != nil {
+			log.Errorf("[ddl] delRange emulator complete task fail: %s", err)
+			return errors.Trace(err)
+		}
+		log.Infof("[ddl] delRange emulator complete task: (%d, %d)", r.jobID, r.elementID)
+	}
+	return nil
 }
 
 func (dr *delRange) doTask(r DelRangeTask) error {
 	for {
-		finish := false
+		finish := true
 		dr.keys = dr.keys[:0]
-		err := kv.RunInNewTxn(dr.d.store, true, func(txn kv.Transaction) error {
+		err := kv.RunInNewTxn(dr.d.store, false, func(txn kv.Transaction) error {
 			iter, err := txn.Seek(r.startKey)
 			if err != nil {
 				return errors.Trace(err)
@@ -153,9 +162,12 @@ func (dr *delRange) doTask(r DelRangeTask) error {
 
 			for i := 0; i < delBatchSize; i++ {
 				if iter.Valid() {
-					finish = bytes.Equal(iter.Key(), r.endKey)
+					finish = bytes.Compare(iter.Key(), r.endKey) >= 0
 					if !finish {
 						dr.keys = append(dr.keys, iter.Key().Clone())
+						if err := iter.Next(); err != nil {
+							return errors.Trace(err)
+						}
 						continue
 					}
 				}

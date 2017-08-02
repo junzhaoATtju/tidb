@@ -1148,8 +1148,7 @@ func (s *testDBSuite) TestTruncateTable(c *C) {
 		}
 		time.Sleep(time.Millisecond * 100)
 	}
-	// TODO: fix this.
-	// c.Assert(hasOldTableData, IsFalse)
+	c.Assert(hasOldTableData, IsFalse)
 }
 
 func (s *testDBSuite) TestRenameTable(c *C) {
